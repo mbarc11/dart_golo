@@ -190,6 +190,90 @@ void main() {
       // Caching: subsequent access returns the same instance.
       expect(identical(lib, BoardMatcher.defaultLibrary), isTrue);
     });
+
+    test('returned list is unmodifiable', () {
+      final lib = BoardMatcher.defaultLibrary;
+      expect(() => lib.removeLast(), throwsUnsupportedError);
+      expect(() => lib.first.anchors.removeLast(), throwsUnsupportedError);
+      expect(() => lib.first.vertices.removeLast(), throwsUnsupportedError);
+    });
+  });
+
+  group('BoardMatcher.matchCorner', () {
+    test('finds the same shape at every corner of a 19x19', () {
+      // Black stones placed at all four 4-4 hoshis.
+      final signs = List.generate(19, (_) => List.filled(19, 0));
+      signs[3][3] = 1;
+      signs[3][15] = 1;
+      signs[15][3] = 1;
+      signs[15][15] = 1;
+      final b = _board(signs);
+
+      final pattern = const Pattern(
+        type: 'corner',
+        size: 19,
+        vertices: [(vertex: (x: 3, y: 3), sign: 1)],
+      );
+
+      final matches = BoardMatcher.matchCorner(b, pattern).toList();
+      expect(matches, isNotEmpty);
+      // Every matched vertex must be one of the four 4-4 hoshis.
+      const corners = {
+        (x: 3, y: 3),
+        (x: 3, y: 15),
+        (x: 15, y: 3),
+        (x: 15, y: 15),
+      };
+      for (final m in matches) {
+        expect(m.vertices.length, 1);
+        expect(corners, contains(m.vertices.single));
+        expect(m.invert, isFalse);
+      }
+    });
+
+    test('respects size constraint', () {
+      final empty13 = _board(List.generate(13, (_) => List.filled(13, 0)));
+      final pattern = const Pattern(
+        type: 'corner',
+        size: 19,
+        vertices: [(vertex: (x: 3, y: 3), sign: 1)],
+      );
+      expect(BoardMatcher.matchCorner(empty13, pattern).toList(), isEmpty);
+    });
+
+    test('reports inverted matches when colours are flipped', () {
+      final signs = List.generate(19, (_) => List.filled(19, 0));
+      signs[3][3] = -1; // single white stone at the corner.
+      final b = _board(signs);
+      final pattern = const Pattern(
+        type: 'corner',
+        size: 19,
+        vertices: [(vertex: (x: 3, y: 3), sign: 1)],
+      );
+      final matches = BoardMatcher.matchCorner(b, pattern).toList();
+      expect(matches, isNotEmpty);
+      expect(matches.every((m) => m.invert), isTrue);
+    });
+
+    test('does not crash on degenerate 1xN boards', () {
+      // Real Go isn't played on 1xN, but the matcher shouldn't throw
+      // IntegerDivisionByZeroException via _mod(_, width-1 == 0).
+      final b = Board(
+          List.generate(1, (_) => List<Stone?>.filled(5, null)));
+      b.set(_v(0, 0), Stone.black);
+      final pattern = const Pattern(
+        type: 'corner',
+        vertices: [(vertex: (x: 0, y: 0), sign: 1)],
+      );
+      expect(
+        () => BoardMatcher.matchCorner(b, pattern).toList(),
+        returnsNormally,
+      );
+      expect(
+        () => BoardMatcher.nameMove(b, Stone.black, _v(2, 0)),
+        returnsNormally,
+      );
+    });
   });
 }
 

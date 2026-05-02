@@ -60,12 +60,14 @@ class Pattern {
           ? int.tryParse(json['size'] as String)
           : json['size'] as int?,
       type: json['type'] as String?,
-      anchors: (json['anchors'] as List<dynamic>? ?? const [])
-          .map((e) => parseSv(e as List<dynamic>))
-          .toList(),
-      vertices: (json['vertices'] as List<dynamic>)
-          .map((e) => parseSv(e as List<dynamic>))
-          .toList(),
+      anchors: List.unmodifiable(
+        (json['anchors'] as List<dynamic>? ?? const [])
+            .map((e) => parseSv(e as List<dynamic>)),
+      ),
+      vertices: List.unmodifiable(
+        (json['vertices'] as List<dynamic>)
+            .map((e) => parseSv(e as List<dynamic>)),
+      ),
     );
   }
 }
@@ -138,9 +140,15 @@ List<({int x, int y})> _symmetries(int x, int y) => [
 
 /// Board-aware symmetries of [v]: applies [_symmetries] then folds via
 /// `mod(_, dim - 1)` so each result is mapped back into the board.
+///
+/// On 1×N or N×1 boards the modulus would be zero — Sabaki's JS handles
+/// this via NaN fall-through (NaN comparisons are false, so [_hasVertex]
+/// filters everything out). We mirror that behaviour explicitly to avoid
+/// `IntegerDivisionByZeroException` in Dart.
 List<Vertex> _boardSymmetries(Vertex v, int width, int height) {
   final mx = width - 1;
   final my = height - 1;
+  if (mx == 0 || my == 0) return const [];
   final result = <Vertex>[];
   for (final s in _symmetries(v.x, v.y)) {
     final mapped = (x: _mod(s.x, mx), y: _mod(s.y, my));
@@ -346,11 +354,14 @@ class BoardMatcher {
 
   /// The 58-pattern opening library shipped with Sabaki — Chinese, Orthodox,
   /// Kobayashi, Shusaku, sanrensei, common joseki, etc. Loaded lazily on
-  /// first use.
+  /// first use. The returned list (and each [Pattern]'s `anchors` /
+  /// `vertices`) is unmodifiable so a caller can't corrupt the cached
+  /// singleton for everyone else.
   static List<Pattern> get defaultLibrary {
-    return _defaultLibrary ??= (jsonDecode(defaultLibraryJson) as List)
-        .map((e) => Pattern.fromJson(e as Map<String, dynamic>))
-        .toList(growable: false);
+    return _defaultLibrary ??= List.unmodifiable(
+      (jsonDecode(defaultLibraryJson) as List)
+          .map((e) => Pattern.fromJson(e as Map<String, dynamic>)),
+    );
   }
 
   /// Yields every match of [pattern] on [board], regardless of the
