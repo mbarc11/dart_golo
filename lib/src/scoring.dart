@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math' as math;
 
 import 'board.dart';
@@ -194,11 +195,14 @@ List<List<double>> _radianceMap(SignMap data, int sign,
   }
 
   void castRadiance(List<List<int>> chain) {
-    final queue = [for (final v in chain) [v, 0]];
+    final queue = ListQueue<List<dynamic>>();
+    for (final v in chain) {
+      queue.addLast([v, 0]);
+    }
     final visited = <int>{};
 
     while (queue.isNotEmpty) {
-      final entry = queue.removeAt(0);
+      final entry = queue.removeFirst();
       final v = entry[0] as List<int>;
       final d = entry[1] as int;
       final mv = mirror(v);
@@ -215,7 +219,7 @@ List<List<double>> _radianceMap(SignMap data, int sign,
         final key = ny * (width + 1) + nx + width * height;
         if (visited.contains(key)) continue;
         visited.add(key);
-        queue.add([n, d + 1]);
+        queue.addLast([n, d + 1]);
       }
     }
   }
@@ -274,7 +278,10 @@ double _avg(Iterable<double> xs) {
 ///   `{-1, 0, 1}`. When false, returns continuous [-1, 1] influence values.
 /// - [maxDistance]: empty points farther than this from the closer colour are
 ///   treated as neutral.
-/// - [minRadiance]: empty points with weaker radiance than this are neutral.
+/// - [minRadiance]: empty points whose radiance, rounded to the nearest
+///   integer, is below this value are treated as neutral. The rounding is
+///   intentional and matches `Math.round` in @sabaki/influence — pass an
+///   integer-valued threshold (e.g. 2) for predictable behaviour.
 SignMap influenceMap(
   SignMap data, {
   bool discrete = true,
@@ -301,6 +308,9 @@ SignMap influenceMap(
       final dist = s > 0 ? pnn[y][x] : nnn[y][x];
       final rad = s > 0 ? pr[y][x] : nr[y][x];
       final faraway = s == 0 || dist > maxDistance;
+      // Verbatim from @sabaki/influence: `Math.round(...) < minRadiance`.
+      // The rounding matters — a continuous radiance of 1.9 is treated as
+      // "bright enough" for minRadiance == 2. Don't drop the round.
       final dim = s == 0 || rad.round() < minRadiance;
 
       if (faraway || dim) {
@@ -592,14 +602,15 @@ class Scorer {
     int iterations = 100,
     int? seed,
   }) {
-    final settled = settleForScoring(
+    final dead = guessDeadStones(
       board,
       iterations: iterations,
+      finished: true,
       seed: seed,
     );
     return scoreWithDeadStones(
       board,
-      settled.dead,
+      dead,
       komi: komi,
       handicap: handicap,
     );
@@ -854,7 +865,11 @@ class _PseudoBoard {
   }
 
   /// Plays at [vertex] for [sign] under playout-friendly rules:
-  ///   - rejected if all neighbours are own colour or empty (eye/own area)
+  ///   - rejected if no in-bounds neighbour is empty or opponent — i.e.
+  ///     every in-bounds neighbour is own colour. Off-board "neighbours"
+  ///     are filtered out by [getNeighbors] and therefore implicitly count
+  ///     as walls, matching `pseudo_board.rs::make_pseudo_move`'s rule
+  ///     "all neighbours are off-board or own colour".
   ///   - rejected if move kills only own single point and captures nothing
   ///   - rejected if move's chain has no liberties unless it captures
   ///
@@ -862,10 +877,12 @@ class _PseudoBoard {
   List<int>? makePseudoMove(int sign, int vertex) {
     final neighbors = getNeighbors(vertex);
 
-    if (neighbors.every((n) {
-      final s = get(n);
-      return s == null || s == sign;
-    })) {
+    // Rust's predicate is `s == None || s == Some(sign)`. Since
+    // [getNeighbors] only yields in-bounds neighbours, `s` is never null
+    // here, so this collapses to `s == sign`. An empty neighbour (s == 0)
+    // or opponent neighbour (s == -sign) makes the predicate false and
+    // the move proceeds.
+    if (neighbors.every((n) => get(n) == sign)) {
       return null;
     }
 
