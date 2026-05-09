@@ -4,12 +4,31 @@
   Sabaki's `@sabaki/boardmatcher` and shipping the same 58-pattern
   opening library.
   - Static API: `nameMove`, `findPatternInMove`, `matchShape`,
-    `matchCorner`, `findAllPatterns`, `defaultLibrary`.
+    `matchCorner`, `findAllPatterns`, `defaultLibrary`,
+    `extendedLibrary`, `combinedLibrary`.
   - Recognises `Pass`, `Take`, `Atari`, `Self-Atari` (new), `Suicide`,
     `Fill`, `Connect`, library shapes, `Tengen`, `Hoshi`, and corner
     point names from the library.
   - Convenience extension `BoardMatching` exposes the same operations
     as instance methods on `Board`.
+- Added: `extendedLibrary` of patterns beyond Sabaki's set:
+  - `Crosscut` — 2×2 alternating cut (Sabaki's `Cut` pattern depicts
+    the same shape under a less common name; we now report
+    `Crosscut` for it).
+  - `Monkey Jump` (saru-suberi) — corner-anchored 3-1 keima from the
+    second line to the first (size 19).
+  - `Cap` (boshi) — friendly stone played one space toward the centre
+    of an isolated opponent stone.
+  - `BoardMatcher.nameMove` / `findPatternInMove` default to
+    `combinedLibrary` (extended + Sabaki) so the more specific names
+    win.
+- Added: `MoveLocalizations` for translating the names returned by
+  `BoardMatcher.nameMove` into `en`, `ja`, `ko`, `zh`, `zh_HK`,
+  `zh_TW` (matching `igo-social-flutter`'s locale set). Translator
+  source-of-truth ARB files live in `lib/l10n/`. `BCP-47` dash forms
+  (`zh-HK`) and base-language fallback (`zh_CN` → `zh`) are handled.
+- Added: `Pattern.localizedName(locale)` extension and an ARB ↔ Dart
+  consistency test.
 - Internals: sign maps stored as a flat `Int8List`, dihedral
   hypotheses tracked as an 8-bit bitfield, and chain liberty traversal
   is iterative with capped early-exit.

@@ -27,6 +27,7 @@ import 'dart:typed_data';
 
 import 'board.dart';
 import 'board_matcher_library.dart' show defaultLibraryJson;
+import 'move_localizations.dart' show MoveLocalizations;
 
 /// `(vertex, sign)` pair where `sign` is `-1` (white), `0` (empty) or
 /// `1` (black). Used inside [Pattern] anchors and vertices.
@@ -453,21 +454,95 @@ Iterable<PatternMatch> _matchCorner(_SignMap m, Pattern pattern) sync* {
 ///
 /// Built around an embedded version of Sabaki's curated 58-pattern
 /// opening library (Chinese, Orthodox, Kobayashi, Shusaku, sanrensei,
-/// common joseki, etc.). Use [defaultLibrary] for that, or pass your own
-/// `List<Pattern>` to [findPatternInMove] / [nameMove].
+/// common joseki, etc.) plus a small [extendedLibrary] of golo
+/// additions (Crosscut, Monkey Jump, Cap). Use [defaultLibrary],
+/// [extendedLibrary], or [combinedLibrary] (the default for
+/// [nameMove] / [findPatternInMove]), or pass your own `List<Pattern>`.
 class BoardMatcher {
   BoardMatcher._();
 
   static List<Pattern>? _defaultLibrary;
+  static List<Pattern>? _combinedLibrary;
 
-  /// The 58-pattern opening library shipped with the package. Loaded
-  /// lazily on first use; the returned list (and each [Pattern]'s
-  /// `anchors` / `vertices`) is unmodifiable so callers can't corrupt
-  /// the cached singleton.
+  /// The 58-pattern opening library shipped with the package, sourced
+  /// verbatim from `@sabaki/boardmatcher`. Loaded lazily on first use;
+  /// the returned list (and each [Pattern]'s `anchors` / `vertices`) is
+  /// unmodifiable so callers can't corrupt the cached singleton.
   static List<Pattern> get defaultLibrary {
     return _defaultLibrary ??= List.unmodifiable(
       (jsonDecode(defaultLibraryJson) as List)
           .map((e) => Pattern.fromJson(e as Map<String, dynamic>)),
+    );
+  }
+
+  /// Extra shape patterns that go beyond Sabaki's library but are
+  /// commonly named by Go players.
+  ///
+  /// - `Crosscut`: two stones of each colour cutting on a 2×2 square.
+  /// - `Monkey Jump`: 3-1 jump from the second line to the first line
+  ///   along a corner edge (`type: 'corner'`, size 19).
+  /// - `Cap`: friendly stone played one space toward the centre from
+  ///   an opponent stone (one-point jump apart, opposite colours).
+  static const List<Pattern> extendedLibrary = [
+    Pattern(
+      name: 'Crosscut',
+      url: 'https://senseis.xmp.net/?Crosscut',
+      anchors: [(vertex: (x: 3, y: 3), sign: 1)],
+      vertices: [
+        (vertex: (x: 3, y: 3), sign: 1),
+        (vertex: (x: 4, y: 4), sign: 1),
+        (vertex: (x: 4, y: 3), sign: -1),
+        (vertex: (x: 3, y: 4), sign: -1),
+      ],
+    ),
+    Pattern(
+      name: 'Monkey Jump',
+      url: 'https://senseis.xmp.net/?MonkeyJump',
+      type: 'corner',
+      size: 19,
+      // Anchors deliberately avoid the literal corner cell (e.g.
+      // (18, 0)) — under corner symmetry it folds to (0, 0) and the
+      // shape becomes unmatchable. Both anchors live one off the edge.
+      anchors: [
+        (vertex: (x: 14, y: 1), sign: 1),
+        (vertex: (x: 17, y: 0), sign: 1),
+      ],
+      vertices: [
+        (vertex: (x: 14, y: 1), sign: 1),
+        (vertex: (x: 17, y: 0), sign: 1),
+        (vertex: (x: 15, y: 0), sign: 0),
+        (vertex: (x: 16, y: 0), sign: 0),
+        (vertex: (x: 15, y: 1), sign: 0),
+        (vertex: (x: 16, y: 1), sign: 0),
+        (vertex: (x: 17, y: 1), sign: 0),
+      ],
+    ),
+    Pattern(
+      name: 'Cap',
+      url: 'https://senseis.xmp.net/?Boshi',
+      anchors: [(vertex: (x: 3, y: 5), sign: 1)],
+      vertices: [
+        (vertex: (x: 3, y: 5), sign: 1),
+        (vertex: (x: 3, y: 4), sign: 0),
+        (vertex: (x: 3, y: 3), sign: -1),
+        (vertex: (x: 2, y: 4), sign: 0),
+        (vertex: (x: 4, y: 4), sign: 0),
+        (vertex: (x: 2, y: 5), sign: 0),
+        (vertex: (x: 4, y: 5), sign: 0),
+      ],
+    ),
+  ];
+
+  /// [extendedLibrary] followed by [defaultLibrary]. This is the
+  /// library [nameMove] / [findPatternInMove] use unless overridden.
+  ///
+  /// Extensions go first so the more specific names take precedence —
+  /// e.g. a corner-area `Monkey Jump` is reported as such rather than
+  /// the generic `Large Knight` shape it shares geometry with, and a
+  /// 2×2 alternating cut is reported as `Crosscut` rather than `Cut`.
+  static List<Pattern> get combinedLibrary {
+    return _combinedLibrary ??= List.unmodifiable(
+      [...extendedLibrary, ...defaultLibrary],
     );
   }
 
@@ -485,7 +560,7 @@ class BoardMatcher {
   ///
   /// Returns one of: `Pass`, `Take`, `Atari`, `Self-Atari`, `Suicide`,
   /// `Fill`, `Connect`, any [Pattern.name] from [library] (defaults to
-  /// [defaultLibrary]), `Tengen`, `Hoshi`, or `null` if the move can't
+  /// [combinedLibrary]), `Tengen`, `Hoshi`, or `null` if the move can't
   /// be classified.
   ///
   /// Pass `vertex == null` (or [stone] == null) for a pass move.
@@ -615,7 +690,7 @@ class BoardMatcher {
     if (friendlyNeighbors.length >= 2) return synth('Connect');
 
     // Library pattern.
-    final lib = library ?? defaultLibrary;
+    final lib = library ?? combinedLibrary;
     for (final pattern in lib) {
       for (final match in _matchShape(next, v, pattern)) {
         return FoundPattern(pattern, match);
@@ -647,7 +722,7 @@ class BoardMatcher {
     List<Pattern>? library,
   }) sync* {
     final m = _SignMap.fromBoard(board);
-    final lib = library ?? defaultLibrary;
+    final lib = library ?? combinedLibrary;
     for (final pattern in lib) {
       if (pattern.isCorner) {
         for (final match in _matchCorner(m, pattern)) {
@@ -706,6 +781,15 @@ void _floodClear(_SignMap m, int x, int y) {
       m.data[nidx] = 0;
       stack.add(nidx);
     }
+  }
+}
+
+/// Returns [Pattern.name] translated into [locale] via
+/// [MoveLocalizations]. `null` if the pattern is unnamed.
+extension PatternLocalization on Pattern {
+  String? localizedName(String locale) {
+    final n = name;
+    return n == null ? null : MoveLocalizations.of(locale).translate(n);
   }
 }
 

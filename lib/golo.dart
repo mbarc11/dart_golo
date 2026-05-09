@@ -7,3 +7,4 @@ export 'src/node.dart';
 export 'src/sgf_tree.dart';
 export 'src/board_tree.dart';
 export 'src/board_matcher.dart';
+export 'src/move_localizations.dart';

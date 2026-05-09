@@ -123,6 +123,30 @@ for (final fp in board.findAllPatterns()) {
 }
 ```
 
+### Localized names
+
+`MoveLocalizations` translates the canonical English names returned
+by `nameMove` / `Pattern.name` into `en`, `ja`, `ko`, `zh`, `zh_HK`,
+and `zh_TW` (matching `igo-social-flutter`'s locale set). Source ARB
+files live in [lib/l10n/](lib/l10n/); the runtime payload is
+embedded in [lib/src/move_localizations.dart](lib/src/move_localizations.dart).
+
+```dart
+final ja = MoveLocalizations.of('ja');
+ja.translate('Atari');         // 'アタリ'
+ja.translate('4-4 Point');     // '星'
+ja.translate('Self-Atari');    // '自アタリ'
+
+// BCP-47 dash forms work; unknown locales fall back to English.
+MoveLocalizations.of('zh-HK').translate('Suicide');  // '自殺'
+MoveLocalizations.of('xx').translate('Atari');       // 'Atari'
+
+// Shortcut on Pattern:
+BoardMatcher.combinedLibrary
+    .firstWhere((p) => p.name == 'Stretch')
+    .localizedName('ja');                            // 'ノビ'
+```
+
 ## Examples
 
 ### REPL

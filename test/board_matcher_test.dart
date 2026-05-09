@@ -92,8 +92,11 @@ void main() {
     test('library shapes', () {
       expect(BoardMatcher.nameMove(unfinished, Stone.black, _v(7, 1)),
           'Stretch');
+      // Sabaki's fixture expected 'Cut' here, but the actual shape
+      // (B/W on one diagonal, W/B on the other) is universally a
+      // Crosscut. Our extendedLibrary supplies the correct name.
       expect(BoardMatcher.nameMove(unfinished, Stone.black, _v(10, 16)),
-          'Cut');
+          'Crosscut');
     });
 
     test('hoshis', () {
@@ -316,12 +319,47 @@ void main() {
     });
   });
 
+  group('Extended library patterns', () {
+    test('Crosscut: 2x2 with both diagonals filled', () {
+      final b = Board.fromDimension(9);
+      b.set(_v(4, 4), Stone.black);
+      b.set(_v(4, 3), Stone.white);
+      b.set(_v(3, 4), Stone.white);
+      expect(BoardMatcher.nameMove(b, Stone.black, _v(3, 3)), 'Crosscut');
+    });
+
+    test('Cap: friendly stone one space toward centre from opponent', () {
+      // Mid-board so corner-anchored Approach patterns can't match.
+      final b = Board.fromDimension(19);
+      b.set(_v(9, 9), Stone.white);
+      expect(BoardMatcher.nameMove(b, Stone.black, _v(9, 11)), 'Cap');
+    });
+
+    test('Monkey Jump: 3-1 from 2nd line to 1st line near corner', () {
+      // Anchors at (14, 1) and (17, 0); pattern lives one off the
+      // exact corner so corner symmetry can resolve it.
+      final b = Board.fromDimension(19);
+      b.set(_v(14, 1), Stone.black);
+      expect(BoardMatcher.nameMove(b, Stone.black, _v(17, 0)),
+          'Monkey Jump');
+    });
+
+    test('combinedLibrary == defaultLibrary + extendedLibrary', () {
+      final combined = BoardMatcher.combinedLibrary;
+      final dflt = BoardMatcher.defaultLibrary;
+      final ext = BoardMatcher.extendedLibrary;
+      expect(combined.length, dflt.length + ext.length);
+      // Identity-stable on repeated access:
+      expect(identical(combined, BoardMatcher.combinedLibrary), isTrue);
+    });
+  });
+
   group('BoardMatching extension on Board', () {
     test('forwards nameMove / matchShape / findPatternInMove', () {
       final unfinished = _board(_unfinished);
       expect(unfinished.nameMove(Stone.black, _v(7, 1)), 'Stretch');
       expect(unfinished.findPatternInMove(Stone.black, _v(10, 16))?.pattern.name,
-          'Cut');
+          'Crosscut');
     });
 
     test('findAllPatterns yields at least every corner-style match', () {
