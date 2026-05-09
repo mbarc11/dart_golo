@@ -275,6 +275,64 @@ void main() {
       );
     });
   });
+
+  group('BoardMatcher.nameMove (Dart additions)', () {
+    test('Self-Atari: own move reduces own chain to one liberty', () {
+      // Top-left of a 9x9, x → / y ↓:
+      //   . X O . . .
+      //   . X O . . .
+      //   . O . . . .
+      // Black plays (0, 0): chain {(0,0),(1,0),(1,1)} has only (0,1)
+      // as a liberty.
+      final signs = List.generate(9, (_) => List.filled(9, 0));
+      signs[0][1] = 1;
+      signs[0][2] = -1;
+      signs[1][1] = 1;
+      signs[1][2] = -1;
+      signs[2][1] = -1;
+      expect(BoardMatcher.nameMove(_board(signs), Stone.black, _v(0, 0)),
+          'Self-Atari');
+    });
+
+    test('Capture takes priority over self-atari status', () {
+      // 5x5: lone white at (0,0) with a black at (1,0). White's only
+      // remaining liberty is (0,1). Black playing (0,1) captures it.
+      final signs = List.generate(5, (_) => List.filled(5, 0));
+      signs[0][0] = -1;
+      signs[0][1] = 1;
+      expect(BoardMatcher.nameMove(_board(signs), Stone.black, _v(0, 1)),
+          'Take');
+    });
+
+    test('Atari on enemy is reported even when own chain is healthy', () {
+      // White chain {(0,0),(0,1)} with a pre-existing black at (1,0)
+      // has 2 libs: (0,2),(1,1). Black playing (1,1) drops it to 1.
+      final signs = List.generate(7, (_) => List.filled(7, 0));
+      signs[0][0] = -1;
+      signs[1][0] = -1;
+      signs[0][1] = 1;
+      expect(BoardMatcher.nameMove(_board(signs), Stone.black, _v(1, 1)),
+          'Atari');
+    });
+  });
+
+  group('BoardMatching extension on Board', () {
+    test('forwards nameMove / matchShape / findPatternInMove', () {
+      final unfinished = _board(_unfinished);
+      expect(unfinished.nameMove(Stone.black, _v(7, 1)), 'Stretch');
+      expect(unfinished.findPatternInMove(Stone.black, _v(10, 16))?.pattern.name,
+          'Cut');
+    });
+
+    test('findAllPatterns yields at least every corner-style match', () {
+      final empty = _board(_empty);
+      // Place a black 4-4 stone at (15, 3) and confirm the "4-4 Point"
+      // corner pattern is reported among the matches.
+      empty.set(_v(15, 3), Stone.black);
+      final matches = empty.findAllPatterns().toList();
+      expect(matches.any((m) => m.pattern.name == '4-4 Point'), isTrue);
+    });
+  });
 }
 
 // Verbatim copies of fixtures from

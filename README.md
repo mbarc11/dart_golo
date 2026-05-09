@@ -89,6 +89,40 @@ board.isValid();
 board.getHandicapPlacement(4, tygem: true);
 ```
 
+## Pattern matching
+
+`BoardMatcher` classifies candidate moves and finds shape matches
+on a position. The 58‑pattern opening library from Sabaki ships with
+the package and is loaded lazily.
+
+```dart
+import 'package:golo/golo.dart';
+
+final board = Board.fromDimension(19);
+
+// Name a candidate move (extension on Board, or via BoardMatcher.*)
+board.nameMove(Stone.black, (x: 3, y: 3));         // '4-4 Point'
+board.nameMove(Stone.black, (x: 9, y: 9));         // 'Tengen'
+BoardMatcher.nameMove(board, null, null);          // 'Pass'
+
+// Self-atari, take, suicide, etc. are reported in addition to
+// shape names from the library (Stretch, Cut, Hane, Keima, …).
+
+// Match an arbitrary shape anywhere on the board
+final pattern = const Pattern(
+  anchors: [(vertex: (x: 0, y: 2), sign: 1), (vertex: (x: 2, y: 2), sign: 1)],
+  vertices: [(vertex: (x: 1, y: 1), sign: 1)],
+);
+for (final m in board.matchShape((x: 3, y: 3), pattern)) {
+  print('matched at symmetry ${m.symmetryIndex}, anchors ${m.anchors}');
+}
+
+// Walk every library hit on the board.
+for (final fp in board.findAllPatterns()) {
+  print('${fp.pattern.name}: ${fp.match.vertices}');
+}
+```
+
 ## Examples
 
 ### REPL
@@ -136,4 +170,4 @@ Details:
 - Honors `SZ` and root setup `AB`/`AW`/`AE`.
 
 ## License
-MIT License. Portions adapted from [SabakiHQ/go-board](https://github.com/SabakiHQ/go-board) (MIT) and [SabakiHQ/sgf](https://github.com/SabakiHQ/sgf) (MIT). See `LICENSE` for third‑party notices.
+MIT License. Portions adapted from [SabakiHQ/go-board](https://github.com/SabakiHQ/go-board) (MIT), [SabakiHQ/sgf](https://github.com/SabakiHQ/sgf) (MIT), and [SabakiHQ/boardmatcher](https://github.com/SabakiHQ/boardmatcher) (MIT — opening library and matching model). See `LICENSE` for third‑party notices.

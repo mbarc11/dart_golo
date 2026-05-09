@@ -1,14 +1,29 @@
-// Pattern and shape matching for Go board positions.
-//
-// Direct port of Sabaki's `@sabaki/boardmatcher`:
-//   https://github.com/SabakiHQ/boardmatcher
-//
-// Supports finding patterns by shape or by corner, and giving a human
-// name to a candidate move (`Pass`, `Take`, `Atari`, `Suicide`, `Fill`,
-// `Connect`, named opening shapes from the embedded library, plus
-// `Tengen` / `Hoshi` / `<n>-<n> Point`).
+/// Pattern and shape matching for Go board positions.
+///
+/// Adopts the matching model used by [Sabaki's @sabaki/boardmatcher][1]:
+/// patterns describe sign-anchored shapes that can be matched under the 8
+/// dihedral symmetries of the board, and a candidate move is classified
+/// as one of `Pass`, `Take`, `Atari`, `Self-Atari`, `Suicide`, `Fill`,
+/// `Connect`, a named pattern from the embedded library, `Tengen`,
+/// `Hoshi`, or `<n>-<n> Point`.
+///
+/// The data model and embedded opening library are inherited from the
+/// upstream JS project; the algorithms below have been rewritten in
+/// idiomatic Dart with a few changes:
+///
+/// - Sign maps are stored as a single [Int8List] indexed `y * width + x`,
+///   not a `List<List<int>>` of boxed integers.
+/// - Symmetry hypotheses are tracked as an 8-bit bitfield instead of a
+///   `List<bool>`.
+/// - Liberty traversal is iterative with an explicit stack.
+/// - The 8 dihedral transforms are evaluated by closed-form switch
+///   instead of allocating a list of 8 records per call.
+///
+/// [1]: https://github.com/SabakiHQ/boardmatcher
+library;
 
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'board.dart';
 import 'board_matcher_library.dart' show defaultLibraryJson;
@@ -24,7 +39,7 @@ typedef SignedVertex = ({Vertex vertex, int sign});
 /// - When [type] is `'corner'`, anchors are checked against the board's
 ///   corner symmetries; otherwise the pattern is translation-invariant.
 /// - [vertices] lists `(vertex, sign)` requirements that must hold.
-/// - [anchors] lists optional reference points used to seed [matchShape].
+/// - [anchors] lists optional reference points used to seed [BoardMatcher.matchShape].
 class Pattern {
   final String? name;
   final String? url;
@@ -53,12 +68,11 @@ class Pattern {
       );
     }
 
+    final rawSize = json['size'];
     return Pattern(
       name: json['name'] as String?,
       url: json['url'] as String?,
-      size: json['size'] is String
-          ? int.tryParse(json['size'] as String)
-          : json['size'] as int?,
+      size: rawSize is String ? int.tryParse(rawSize) : rawSize as int?,
       type: json['type'] as String?,
       anchors: List.unmodifiable(
         (json['anchors'] as List<dynamic>? ?? const [])
@@ -102,90 +116,165 @@ class FoundPattern {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — direct port of `boardmatcher/src/helper.js`.
+// Sign map: packed Int8 representation of the board, used by every matcher.
 // ---------------------------------------------------------------------------
 
-int _mod(int x, int m) => ((x % m) + m) % m;
+/// Compact `(width, height)` sign map: `-1` white, `0` empty, `+1` black.
+/// Stored as a flat [Int8List] indexed `y * width + x`. All matcher hot
+/// paths read through this view to avoid `Stone?` boxing and `List<List>`
+/// indirection.
+class _SignMap {
+  final Int8List data;
+  final int width;
+  final int height;
 
-int _signOf(Stone? s) =>
-    s == null ? 0 : (s == Stone.black ? 1 : -1);
+  _SignMap._(this.data, this.width, this.height);
 
-bool _hasVertex(Vertex v, int width, int height) =>
-    v.x >= 0 && v.y >= 0 && v.x < width && v.y < height;
-
-List<Vertex> _neighbors(Vertex v, int width, int height) {
-  final result = <Vertex>[];
-  for (final n in [
-    (x: v.x - 1, y: v.y),
-    (x: v.x + 1, y: v.y),
-    (x: v.x, y: v.y - 1),
-    (x: v.x, y: v.y + 1),
-  ]) {
-    if (_hasVertex(n, width, height)) result.add(n);
+  factory _SignMap.fromBoard(Board b) {
+    final w = b.width;
+    final h = b.height;
+    final out = Int8List(w * h);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      final row = b.state[y];
+      for (var x = 0; x < w; x++) {
+        final s = row[x];
+        out[i++] = s == null ? 0 : (s == Stone.black ? 1 : -1);
+      }
+    }
+    return _SignMap._(out, w, h);
   }
-  return result;
+
+  _SignMap clone() => _SignMap._(Int8List.fromList(data), width, height);
+
+  int at(int x, int y) => data[y * width + x];
+  void set(int x, int y, int v) => data[y * width + x] = v;
+  bool inBounds(int x, int y) =>
+      x >= 0 && y >= 0 && x < width && y < height;
 }
 
-/// 8 dihedral symmetries of the 2-vector `(x, y)`.
-List<({int x, int y})> _symmetries(int x, int y) => [
-      (x: x, y: y),
-      (x: -x, y: y),
-      (x: x, y: -y),
-      (x: -x, y: -y),
-      (x: y, y: x),
-      (x: -y, y: x),
-      (x: y, y: -x),
-      (x: -y, y: -x),
-    ];
+// ---------------------------------------------------------------------------
+// Dihedral symmetries — closed form, no per-call allocation.
+//
+// Indices, matching Sabaki's enumeration:
+//   0: ( x,  y)   1: (-x,  y)   2: ( x, -y)   3: (-x, -y)
+//   4: ( y,  x)   5: (-y,  x)   6: ( y, -x)   7: (-y, -x)
+// ---------------------------------------------------------------------------
 
-/// Board-aware symmetries of [v]: applies [_symmetries] then folds via
-/// `mod(_, dim - 1)` so each result is mapped back into the board.
+@pragma('vm:prefer-inline')
+int _symX(int i, int x, int y) => switch (i) {
+      0 || 2 => x,
+      1 || 3 => -x,
+      4 || 6 => y,
+      5 || 7 => -y,
+      _ => throw RangeError.range(i, 0, 7, 'symmetry index'),
+    };
+
+@pragma('vm:prefer-inline')
+int _symY(int i, int x, int y) => switch (i) {
+      0 || 1 => y,
+      2 || 3 => -y,
+      4 || 5 => x,
+      6 || 7 => -x,
+      _ => throw RangeError.range(i, 0, 7, 'symmetry index'),
+    };
+
+int _floorMod(int x, int m) => ((x % m) + m) % m;
+
+/// Folds [v] back into the board via the 8 dihedral transforms then
+/// `mod (dim - 1)`. Returns vertices in symmetry-index order, or `null`
+/// at indices where the result falls off the board.
 ///
-/// On 1×N or N×1 boards the modulus would be zero — Sabaki's JS handles
-/// this via NaN fall-through (NaN comparisons are false, so [_hasVertex]
-/// filters everything out). We mirror that behaviour explicitly to avoid
-/// `IntegerDivisionByZeroException` in Dart.
-List<Vertex> _boardSymmetries(Vertex v, int width, int height) {
+/// On 1×N or N×1 boards `dim - 1 == 0`; the JS reference relies on NaN
+/// fall-through, we explicitly return an all-`null` list so callers can
+/// short-circuit cleanly.
+List<Vertex?> _boardSymmetries(int x, int y, int width, int height) {
   final mx = width - 1;
   final my = height - 1;
-  if (mx == 0 || my == 0) return const [];
-  final result = <Vertex>[];
-  for (final s in _symmetries(v.x, v.y)) {
-    final mapped = (x: _mod(s.x, mx), y: _mod(s.y, my));
-    if (_hasVertex(mapped, width, height)) result.add(mapped);
-  }
-  return result;
-}
-
-/// Counts pseudo-liberties of the chain at [v], capped at 3.
-///
-/// Used by [BoardMatcher.findPatternInMove] for atari/take detection.
-/// Caps at 3 because the caller only needs to distinguish 1 / 2 / 3+.
-int _pseudoLibertyCount(List<List<int>> data, Vertex v) {
-  final result = <Vertex>{};
-  final visited = <Vertex>{};
-  final height = data.length;
-  final width = height == 0 ? 0 : data[0].length;
-  final sign = data[v.y][v.x];
-
-  void recurse(Vertex w) {
-    visited.add(w);
-    for (final n in _neighbors(w, width, height)) {
-      if (result.length >= 3) return;
-      final s = data[n.y][n.x];
-      if (s == -sign) continue;
-      if (visited.contains(n)) continue;
-      if (s == 0) {
-        result.add(n);
-        continue;
-      }
-      recurse(n);
+  if (mx == 0 || my == 0) return const [null, null, null, null, null, null, null, null];
+  final out = List<Vertex?>.filled(8, null);
+  for (var i = 0; i < 8; i++) {
+    final wx = _floorMod(_symX(i, x, y), mx);
+    final wy = _floorMod(_symY(i, x, y), my);
+    if (wx >= 0 && wy >= 0 && wx < width && wy < height) {
+      out[i] = (x: wx, y: wy);
     }
   }
-
-  recurse(v);
-  return result.length;
+  return out;
 }
+
+// ---------------------------------------------------------------------------
+// Liberty counting — iterative DFS, capped, no per-step list allocation.
+// ---------------------------------------------------------------------------
+
+/// Counts unique liberties of the chain at `(x, y)` in [m], stopping as
+/// soon as [maxCount] is reached. Returns `0` if the start cell is empty.
+///
+/// Uses a fixed-size `Int8List` for visit / liberty marking instead of a
+/// hash set, which dominates because every traversal in this file caps
+/// out at 3.
+int _countLiberties(_SignMap m, int x, int y, int maxCount) {
+  final width = m.width;
+  final height = m.height;
+  final start = y * width + x;
+  final sign = m.data[start];
+  if (sign == 0) return 0;
+
+  final visited = Int8List(width * height);
+  final libertyMark = Int8List(width * height);
+  final stack = <int>[start];
+  visited[start] = 1;
+  var libCount = 0;
+
+  while (stack.isNotEmpty) {
+    final p = stack.removeLast();
+    final px = p % width;
+    final py = p ~/ width;
+
+    // Unrolled neighbour visit. We deliberately don't extract a closure
+    // because that allocates per call and ends up dominating the profile.
+    for (var dir = 0; dir < 4; dir++) {
+      int nx, ny;
+      switch (dir) {
+        case 0:
+          nx = px - 1;
+          ny = py;
+          break;
+        case 1:
+          nx = px + 1;
+          ny = py;
+          break;
+        case 2:
+          nx = px;
+          ny = py - 1;
+          break;
+        default:
+          nx = px;
+          ny = py + 1;
+      }
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      final nidx = ny * width + nx;
+      if (visited[nidx] != 0) continue;
+      visited[nidx] = 1;
+      final ns = m.data[nidx];
+      if (ns == -sign) continue;
+      if (ns == 0) {
+        if (libertyMark[nidx] == 0) {
+          libertyMark[nidx] = 1;
+          libCount++;
+          if (libCount >= maxCount) return libCount;
+        }
+        continue;
+      }
+      stack.add(nidx);
+    }
+  }
+  return libCount;
+}
+
+// ---------------------------------------------------------------------------
+// Star points / hoshis.
+// ---------------------------------------------------------------------------
 
 /// 4-4 / 3-3 hoshi positions excluding tengen and corner stars.
 List<Vertex> _unnamedHoshis(int width, int height) {
@@ -209,130 +298,148 @@ List<Vertex> _unnamedHoshis(int width, int height) {
   return result;
 }
 
-/// Converts a [Board] to the int sign-map representation used internally
-/// (and by Sabaki's pattern format): `[y][x]` → `-1` / `0` / `1`.
-List<List<int>> _signMap(Board board) {
-  return List.generate(
-    board.height,
-    (y) => List.generate(board.width, (x) {
-      return _signOf(board.get((x: x, y: y)));
-    }),
-  );
-}
-
 // ---------------------------------------------------------------------------
-// Pattern matching — direct ports of matchCorner.js and matchPattern.js.
+// Pattern matching (shape and corner).
 // ---------------------------------------------------------------------------
 
-/// Pure-data variant of [BoardMatcher.matchShape] operating on a sign-map.
+/// Yields every match of [pattern] anchored at `(anchor)` on [m].
 Iterable<PatternMatch> _matchShape(
-    List<List<int>> data, Vertex anchor, Pattern pattern) sync* {
-  final height = data.length;
-  final width = height == 0 ? 0 : data[0].length;
-  if (!_hasVertex(anchor, width, height)) return;
+    _SignMap m, Vertex anchor, Pattern pattern) sync* {
+  final width = m.width;
+  final height = m.height;
+  if (!m.inBounds(anchor.x, anchor.y)) return;
   if (pattern.size != null &&
       (width != height || width != pattern.size)) {
     return;
   }
 
-  final sign = data[anchor.y][anchor.x];
-  if (sign == 0) return;
+  final anchorSign = m.at(anchor.x, anchor.y);
+  if (anchorSign == 0) return;
 
-  for (final a in pattern.anchors) {
+  for (final pa in pattern.anchors) {
     if (pattern.isCorner) {
-      final inSymmetries = _boardSymmetries(a.vertex, width, height)
-          .any((v) => v.x == anchor.x && v.y == anchor.y);
-      if (!inSymmetries) continue;
+      final sym = _boardSymmetries(pa.vertex.x, pa.vertex.y, width, height);
+      var ok = false;
+      for (var i = 0; i < 8; i++) {
+        final v = sym[i];
+        if (v != null && v.x == anchor.x && v.y == anchor.y) {
+          ok = true;
+          break;
+        }
+      }
+      if (!ok) continue;
     }
 
-    // Hypothesise: `anchor` corresponds to pattern anchor `a`.
-    final hypotheses = List<bool>.filled(8, true);
+    // Bitfield of the 8 still-viable hypotheses.
+    var hypotheses = 0xFF;
 
     for (final pv in pattern.vertices) {
-      final dx = pv.vertex.x - a.vertex.x;
-      final dy = pv.vertex.y - a.vertex.y;
-      final symm = _symmetries(dx, dy);
+      final dx = pv.vertex.x - pa.vertex.x;
+      final dy = pv.vertex.y - pa.vertex.y;
+      final expected = pv.sign * anchorSign * pa.sign;
 
-      for (var k = 0; k < symm.length; k++) {
-        if (!hypotheses[k]) continue;
-        final wx = anchor.x + symm[k].x;
-        final wy = anchor.y + symm[k].y;
-        final w = (x: wx, y: wy);
-        if (!_hasVertex(w, width, height) ||
-            data[wy][wx] != pv.sign * sign * a.sign) {
-          hypotheses[k] = false;
+      var bit = 1;
+      for (var k = 0; k < 8; k++, bit <<= 1) {
+        if ((hypotheses & bit) == 0) continue;
+        final wx = anchor.x + _symX(k, dx, dy);
+        final wy = anchor.y + _symY(k, dx, dy);
+        if (wx < 0 || wy < 0 || wx >= width || wy >= height ||
+            m.data[wy * width + wx] != expected) {
+          hypotheses &= ~bit;
         }
       }
 
-      if (!hypotheses.contains(true)) break;
+      if (hypotheses == 0) break;
     }
 
-    for (var i = 0; i < hypotheses.length; i++) {
-      if (!hypotheses[i]) continue;
+    if (hypotheses == 0) continue;
 
-      Vertex transform(Vertex v) {
-        final dx = v.x - a.vertex.x;
-        final dy = v.y - a.vertex.y;
-        final s = _symmetries(dx, dy)[i];
-        return (x: anchor.x + s.x, y: anchor.y + s.y);
-      }
-
+    final invert = anchorSign != pa.sign;
+    var bit = 1;
+    for (var k = 0; k < 8; k++, bit <<= 1) {
+      if ((hypotheses & bit) == 0) continue;
       yield PatternMatch(
-        symmetryIndex: i,
-        invert: sign != a.sign,
-        anchors: pattern.anchors.map((a) => transform(a.vertex)).toList(),
-        vertices: pattern.vertices.map((v) => transform(v.vertex)).toList(),
+        symmetryIndex: k,
+        invert: invert,
+        anchors: [
+          for (final a in pattern.anchors)
+            (
+              x: anchor.x + _symX(k, a.vertex.x - pa.vertex.x,
+                  a.vertex.y - pa.vertex.y),
+              y: anchor.y + _symY(k, a.vertex.x - pa.vertex.x,
+                  a.vertex.y - pa.vertex.y),
+            ),
+        ],
+        vertices: [
+          for (final v in pattern.vertices)
+            (
+              x: anchor.x + _symX(k, v.vertex.x - pa.vertex.x,
+                  v.vertex.y - pa.vertex.y),
+              y: anchor.y + _symY(k, v.vertex.x - pa.vertex.x,
+                  v.vertex.y - pa.vertex.y),
+            ),
+        ],
       );
     }
   }
 }
 
-/// Pure-data variant of [BoardMatcher.matchCorner].
-Iterable<PatternMatch> _matchCorner(
-    List<List<int>> data, Pattern pattern) sync* {
-  final height = data.length;
-  final width = height == 0 ? 0 : data[0].length;
+/// Yields every corner-symmetric match of [pattern] on [m].
+Iterable<PatternMatch> _matchCorner(_SignMap m, Pattern pattern) sync* {
+  final width = m.width;
+  final height = m.height;
   if (pattern.size != null &&
       (width != height || width != pattern.size)) {
     return;
   }
 
-  final hypotheses = List<bool>.filled(8, true);
-  final hypothesesInvert = List<bool>.filled(8, true);
-  final anchors = pattern.anchors;
+  var hypotheses = 0xFF;
+  var hypothesesInvert = 0xFF;
 
-  for (final sv in [...anchors, ...pattern.vertices]) {
-    final reps = _boardSymmetries(sv.vertex, width, height);
-    for (var i = 0; i < hypotheses.length; i++) {
-      if (i >= reps.length) {
-        hypotheses[i] = false;
-        hypothesesInvert[i] = false;
+  void filter(SignedVertex sv) {
+    final sym = _boardSymmetries(sv.vertex.x, sv.vertex.y, width, height);
+    var bit = 1;
+    for (var i = 0; i < 8; i++, bit <<= 1) {
+      final v = sym[i];
+      if (v == null) {
+        hypotheses &= ~bit;
+        hypothesesInvert &= ~bit;
         continue;
       }
-      final r = reps[i];
-      final v = data[r.y][r.x];
-      if (hypotheses[i] && v != sv.sign) hypotheses[i] = false;
-      if (hypothesesInvert[i] && v != -sv.sign) hypothesesInvert[i] = false;
-    }
-    if (!hypotheses.contains(true) && !hypothesesInvert.contains(true)) {
-      return;
+      final cell = m.at(v.x, v.y);
+      if ((hypotheses & bit) != 0 && cell != sv.sign) hypotheses &= ~bit;
+      if ((hypothesesInvert & bit) != 0 && cell != -sv.sign) {
+        hypothesesInvert &= ~bit;
+      }
     }
   }
 
-  for (var invert = 0; invert <= 1; invert++) {
-    for (var i = 0; i < hypotheses.length; i++) {
-      final ok = invert == 0 ? hypotheses[i] : hypothesesInvert[i];
-      if (!ok) continue;
+  for (final sv in pattern.anchors) {
+    filter(sv);
+    if (hypotheses == 0 && hypothesesInvert == 0) return;
+  }
+  for (final sv in pattern.vertices) {
+    filter(sv);
+    if (hypotheses == 0 && hypothesesInvert == 0) return;
+  }
 
-      Vertex transform(Vertex v) =>
-          _boardSymmetries(v, width, height)[i];
-
+  for (var invertBit = 0; invertBit <= 1; invertBit++) {
+    final mask = invertBit == 0 ? hypotheses : hypothesesInvert;
+    if (mask == 0) continue;
+    var bit = 1;
+    for (var i = 0; i < 8; i++, bit <<= 1) {
+      if ((mask & bit) == 0) continue;
       yield PatternMatch(
         symmetryIndex: i,
-        invert: invert == 1,
-        anchors: anchors.map((a) => transform(a.vertex)).toList(),
-        vertices:
-            pattern.vertices.map((v) => transform(v.vertex)).toList(),
+        invert: invertBit == 1,
+        anchors: [
+          for (final a in pattern.anchors)
+            _boardSymmetries(a.vertex.x, a.vertex.y, width, height)[i]!,
+        ],
+        vertices: [
+          for (final v in pattern.vertices)
+            _boardSymmetries(v.vertex.x, v.vertex.y, width, height)[i]!,
+        ],
       );
     }
   }
@@ -344,19 +451,19 @@ Iterable<PatternMatch> _matchCorner(
 
 /// Pattern and shape matching on a [Board].
 ///
-/// Direct port of Sabaki's `@sabaki/boardmatcher`. Use [defaultLibrary]
-/// for Sabaki's curated 58-pattern opening library, or supply your own
-/// list of [Pattern]s.
+/// Built around an embedded version of Sabaki's curated 58-pattern
+/// opening library (Chinese, Orthodox, Kobayashi, Shusaku, sanrensei,
+/// common joseki, etc.). Use [defaultLibrary] for that, or pass your own
+/// `List<Pattern>` to [findPatternInMove] / [nameMove].
 class BoardMatcher {
   BoardMatcher._();
 
   static List<Pattern>? _defaultLibrary;
 
-  /// The 58-pattern opening library shipped with Sabaki — Chinese, Orthodox,
-  /// Kobayashi, Shusaku, sanrensei, common joseki, etc. Loaded lazily on
-  /// first use. The returned list (and each [Pattern]'s `anchors` /
-  /// `vertices`) is unmodifiable so a caller can't corrupt the cached
-  /// singleton for everyone else.
+  /// The 58-pattern opening library shipped with the package. Loaded
+  /// lazily on first use; the returned list (and each [Pattern]'s
+  /// `anchors` / `vertices`) is unmodifiable so callers can't corrupt
+  /// the cached singleton.
   static List<Pattern> get defaultLibrary {
     return _defaultLibrary ??= List.unmodifiable(
       (jsonDecode(defaultLibraryJson) as List)
@@ -364,22 +471,22 @@ class BoardMatcher {
     );
   }
 
-  /// Yields every match of [pattern] on [board], regardless of the
-  /// pattern's `type`. Pattern is treated as a corner-style match.
+  /// Yields every corner-style match of [pattern] on [board].
   static Iterable<PatternMatch> matchCorner(Board board, Pattern pattern) =>
-      _matchCorner(_signMap(board), pattern);
+      _matchCorner(_SignMap.fromBoard(board), pattern);
 
   /// Yields every match of [pattern] on [board] for which [anchor]
   /// corresponds to one of the pattern's anchors.
   static Iterable<PatternMatch> matchShape(
           Board board, Vertex anchor, Pattern pattern) =>
-      _matchShape(_signMap(board), anchor, pattern);
+      _matchShape(_SignMap.fromBoard(board), anchor, pattern);
 
   /// Names a candidate move at [vertex] played by [stone].
   ///
-  /// Returns one of: `Pass`, `Take`, `Atari`, `Suicide`, `Fill`, `Connect`,
-  /// any [Pattern.name] from [library] (defaults to [defaultLibrary]),
-  /// `Tengen`, `Hoshi`, or `null` if the move can't be classified.
+  /// Returns one of: `Pass`, `Take`, `Atari`, `Self-Atari`, `Suicide`,
+  /// `Fill`, `Connect`, any [Pattern.name] from [library] (defaults to
+  /// [defaultLibrary]), `Tengen`, `Hoshi`, or `null` if the move can't
+  /// be classified.
   ///
   /// Pass `vertex == null` (or [stone] == null) for a pass move.
   static String? nameMove(
@@ -406,11 +513,17 @@ class BoardMatcher {
   }) {
     final width = board.width;
     final height = board.height;
-    final sign = stone == null ? 0 : _signOf(stone);
-    final isPass =
-        sign == 0 || vertex == null || !_hasVertex(vertex, width, height);
+    final sign = stone == null
+        ? 0
+        : (stone == Stone.black ? 1 : -1);
+    final isPass = sign == 0 ||
+        vertex == null ||
+        vertex.x < 0 ||
+        vertex.y < 0 ||
+        vertex.x >= width ||
+        vertex.y >= height;
 
-    FoundPattern dummy(String name, [String? url]) {
+    FoundPattern synth(String name, [String? url]) {
       final anchors = isPass
           ? const <SignedVertex>[]
           : [(vertex: vertex, sign: sign)];
@@ -431,35 +544,75 @@ class BoardMatcher {
       );
     }
 
-    if (isPass) return dummy('Pass', 'https://senseis.xmp.net/?Pass');
+    if (isPass) return synth('Pass', 'https://senseis.xmp.net/?Pass');
 
     final v = vertex;
-    final data = _signMap(board);
-    if (data[v.y][v.x] != 0) return null;
+    final m = _SignMap.fromBoard(board);
+    if (m.at(v.x, v.y) != 0) return null;
 
-    final neighbors = _neighbors(v, width, height);
-
-    // Atari / take.
-    for (final n in neighbors) {
-      if (data[n.y][n.x] != -sign) continue;
-      final libs = _pseudoLibertyCount(data, n);
-      if (libs == 1) return dummy('Take');
-      if (libs == 2) return dummy('Atari', 'https://senseis.xmp.net/?Atari');
+    // Inspect the four neighbours once.
+    final neighborSigns = <int>[];
+    final friendlyNeighbors = <int>[];
+    final enemyNeighbors = <int>[];
+    for (var dir = 0; dir < 4; dir++) {
+      final nx = v.x + (dir == 0 ? -1 : dir == 1 ? 1 : 0);
+      final ny = v.y + (dir == 2 ? -1 : dir == 3 ? 1 : 0);
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      final s = m.at(nx, ny);
+      neighborSigns.add(s);
+      if (s == sign) friendlyNeighbors.add(ny * width + nx);
+      if (s == -sign) enemyNeighbors.add(ny * width + nx);
     }
 
-    // Suicide check on hypothetical post-move board.
-    final next = data
-        .map((row) => List<int>.from(row))
-        .toList(growable: false);
-    next[v.y][v.x] = sign;
-    if (_pseudoLibertyCount(next, v) == 0) {
-      return dummy('Suicide', 'https://senseis.xmp.net/?Suicide');
+    // Take / Atari on enemy chains.
+    var anyTake = false;
+    for (final p in enemyNeighbors) {
+      final libs = _countLiberties(m, p % width, p ~/ width, 3);
+      if (libs == 1) {
+        anyTake = true;
+        break;
+      }
+    }
+    if (anyTake) return synth('Take');
+
+    var anyAtari = false;
+    for (final p in enemyNeighbors) {
+      final libs = _countLiberties(m, p % width, p ~/ width, 3);
+      if (libs == 2) {
+        anyAtari = true;
+        break;
+      }
+    }
+    if (anyAtari) return synth('Atari', 'https://senseis.xmp.net/?Atari');
+
+    // Hypothetical post-move sign map. Captures are handled by removing
+    // any enemy chain with zero liberties after the stone is placed.
+    final next = m.clone();
+    next.set(v.x, v.y, sign);
+    var capturedAny = false;
+    for (final p in enemyNeighbors) {
+      final ex = p % width;
+      final ey = p ~/ width;
+      if (next.at(ex, ey) != -sign) continue; // already removed
+      if (_countLiberties(next, ex, ey, 1) == 0) {
+        capturedAny = true;
+        _floodClear(next, ex, ey);
+      }
     }
 
-    // Friendly connection.
-    final friendly = neighbors.where((n) => data[n.y][n.x] == sign).length;
-    if (friendly == neighbors.length) return dummy('Fill');
-    if (friendly >= 2) return dummy('Connect');
+    final ownLibsAfter = _countLiberties(next, v.x, v.y, 3);
+    if (!capturedAny && ownLibsAfter == 0) {
+      return synth('Suicide', 'https://senseis.xmp.net/?Suicide');
+    }
+    if (ownLibsAfter == 1) {
+      return synth('Self-Atari', 'https://senseis.xmp.net/?SelfAtari');
+    }
+
+    if (friendlyNeighbors.length == neighborSigns.length &&
+        neighborSigns.isNotEmpty) {
+      return synth('Fill');
+    }
+    if (friendlyNeighbors.length >= 2) return synth('Connect');
 
     // Library pattern.
     final lib = library ?? defaultLibrary;
@@ -469,19 +622,113 @@ class BoardMatcher {
       }
     }
 
-    // Hoshi-ish points.
-    final mid = ((width - 1) / 2, (height - 1) / 2);
-    if (mid.$1 == mid.$1.toInt() &&
-        mid.$2 == mid.$2.toInt() &&
-        v.x == mid.$1.toInt() &&
-        v.y == mid.$2.toInt()) {
-      return dummy('Tengen', 'https://senseis.xmp.net/?Tengen');
+    // Hoshi / Tengen on an empty point.
+    if (width.isOdd && height.isOdd) {
+      final midX = (width - 1) >> 1;
+      final midY = (height - 1) >> 1;
+      if (v.x == midX && v.y == midY) {
+        return synth('Tengen', 'https://senseis.xmp.net/?Tengen');
+      }
     }
-    if (_unnamedHoshis(width, height)
-        .any((h) => h.x == v.x && h.y == v.y)) {
-      return dummy('Hoshi', 'https://senseis.xmp.net/?StarPoint');
+    for (final h in _unnamedHoshis(width, height)) {
+      if (h.x == v.x && h.y == v.y) {
+        return synth('Hoshi', 'https://senseis.xmp.net/?StarPoint');
+      }
     }
 
     return null;
   }
+
+  /// Yields every match of every pattern in [library] (defaults to
+  /// [defaultLibrary]) on [board], paired with the pattern that produced
+  /// it. Useful for one-shot board analysis.
+  static Iterable<FoundPattern> findAllPatterns(
+    Board board, {
+    List<Pattern>? library,
+  }) sync* {
+    final m = _SignMap.fromBoard(board);
+    final lib = library ?? defaultLibrary;
+    for (final pattern in lib) {
+      if (pattern.isCorner) {
+        for (final match in _matchCorner(m, pattern)) {
+          yield FoundPattern(pattern, match);
+        }
+      } else {
+        // Translation-invariant: try every non-empty cell as anchor.
+        for (var y = 0; y < m.height; y++) {
+          for (var x = 0; x < m.width; x++) {
+            if (m.at(x, y) == 0) continue;
+            for (final match in _matchShape(m, (x: x, y: y), pattern)) {
+              yield FoundPattern(pattern, match);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Iteratively zero out the connected chain starting at `(x, y)`.
+void _floodClear(_SignMap m, int x, int y) {
+  final width = m.width;
+  final height = m.height;
+  final start = y * width + x;
+  final sign = m.data[start];
+  if (sign == 0) return;
+  final stack = <int>[start];
+  m.data[start] = 0;
+  while (stack.isNotEmpty) {
+    final p = stack.removeLast();
+    final px = p % width;
+    final py = p ~/ width;
+    for (var dir = 0; dir < 4; dir++) {
+      int nx, ny;
+      switch (dir) {
+        case 0:
+          nx = px - 1;
+          ny = py;
+          break;
+        case 1:
+          nx = px + 1;
+          ny = py;
+          break;
+        case 2:
+          nx = px;
+          ny = py - 1;
+          break;
+        default:
+          nx = px;
+          ny = py + 1;
+      }
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      final nidx = ny * width + nx;
+      if (m.data[nidx] != sign) continue;
+      m.data[nidx] = 0;
+      stack.add(nidx);
+    }
+  }
+}
+
+/// Convenience shortcuts for [BoardMatcher] on a [Board].
+extension BoardMatching on Board {
+  /// See [BoardMatcher.nameMove].
+  String? nameMove(Stone? stone, Vertex? vertex, {List<Pattern>? library}) =>
+      BoardMatcher.nameMove(this, stone, vertex, library: library);
+
+  /// See [BoardMatcher.findPatternInMove].
+  FoundPattern? findPatternInMove(Stone? stone, Vertex? vertex,
+          {List<Pattern>? library}) =>
+      BoardMatcher.findPatternInMove(this, stone, vertex, library: library);
+
+  /// See [BoardMatcher.matchShape].
+  Iterable<PatternMatch> matchShape(Vertex anchor, Pattern pattern) =>
+      BoardMatcher.matchShape(this, anchor, pattern);
+
+  /// See [BoardMatcher.matchCorner].
+  Iterable<PatternMatch> matchCorner(Pattern pattern) =>
+      BoardMatcher.matchCorner(this, pattern);
+
+  /// See [BoardMatcher.findAllPatterns].
+  Iterable<FoundPattern> findAllPatterns({List<Pattern>? library}) =>
+      BoardMatcher.findAllPatterns(this, library: library);
 }

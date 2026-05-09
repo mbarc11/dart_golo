@@ -1,3 +1,19 @@
+## Unreleased
+
+- Added: `BoardMatcher` for shape and pattern matching, modelled on
+  Sabaki's `@sabaki/boardmatcher` and shipping the same 58-pattern
+  opening library.
+  - Static API: `nameMove`, `findPatternInMove`, `matchShape`,
+    `matchCorner`, `findAllPatterns`, `defaultLibrary`.
+  - Recognises `Pass`, `Take`, `Atari`, `Self-Atari` (new), `Suicide`,
+    `Fill`, `Connect`, library shapes, `Tengen`, `Hoshi`, and corner
+    point names from the library.
+  - Convenience extension `BoardMatching` exposes the same operations
+    as instance methods on `Board`.
+- Internals: sign maps stored as a flat `Int8List`, dihedral
+  hypotheses tracked as an 8-bit bitfield, and chain liberty traversal
+  is iterative with capped early-exit.
+
 ## 1.0.2
 
 - Game: add `depth` (max depth), `currentDepth`, `parentOf`, and `depthOf` helpers.
